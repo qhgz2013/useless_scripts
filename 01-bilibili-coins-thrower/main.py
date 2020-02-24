@@ -67,6 +67,8 @@ def main():
                     with open(cache_coin_av_list, 'w') as f:
                         json.dump(list(cache_list), f)
                     return
+        if len(history_json['data']) == 0:
+            return
         page += 1
 
 
