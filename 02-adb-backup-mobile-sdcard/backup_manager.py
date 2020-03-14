@@ -36,15 +36,26 @@ class BackupManager:
             os.makedirs(path, exist_ok=True)
         assert os.path.isdir(path), 'path must be a directory'
         self._path = path
-        sql_file = os.path.join(self._path, 'entries.db')
-        if not os.path.isfile(sql_file):
-            open(sql_file, 'wb').close()
-        self._sql_conn = SqliteAccessor(sql_file)
+        self._sql_file = os.path.join(self._path, 'entries.db')
+        if not os.path.isfile(self._sql_file):
+            open(self._sql_file, 'wb').close()
+        self._sql_conn = SqliteAccessor(self._sql_file)
         # creating repository directory
         for i in range(256):
             os.makedirs(os.path.join(self._path, 'objects', '%02x' % i), exist_ok=True)
         spawn_process('adb start-server', 'utf8')
         self._thread_count = thread_count
+    
+    def _backup_db(self):
+        print('Backing up database file.')
+        with open(self._sql_file + '.bak', 'wb') as f_out:
+            with open(self._sql_file, 'rb') as f_in:
+                while True:
+                    buffer = f_in.read(4096)
+                    f_out.write(buffer)
+                    if len(buffer) == 0:
+                        break
+        print('Done.')
 
     def list_database(self, path: str) -> List[FileMeta]:
         path = self._abs_path(path)
@@ -126,23 +137,31 @@ class BackupManager:
                 print('Unsupported file permission attribute:', permission)
         return dirs, files
 
-    @staticmethod
-    def _adb_stat(path: str) -> FileMeta:
+    def _adb_stat(self, path: str, retry_count: int = 5) -> FileMeta:
+        if retry_count == 0:
+            raise RuntimeError('Adb repeatly returned empty stat result for path %s' % path)
         # escape char (') in linux shell
-        path = path.replace("'", "'\"'\"'")
+        path_escaped = path.replace("'", "'\"'\"'")
         stdout, stderr = spawn_process(['adb', 'shell', 'stat', '-L', '-c', "'%A/%s/%X/%Y/%W/%n'",
-                                        "'%s'" % path], 'utf8')
+                                        "'%s'" % path_escaped], 'utf8')
         if len(stderr) > 0:
             raise RuntimeError(stderr)
+        if len(stdout) == 0:  # unknown reason for stat returns nothing
+            return self._adb_stat(path, retry_count - 1)
         parts = stdout.rstrip('\r\n').split('/')
 
         def _cvt_ts(x):
             return 0 if x == '?' else int(x)
-        return FileMeta(path_id=0, file_name=parts[-1], file_size=int(parts[1]),
-                        access_time=datetime.datetime.fromtimestamp(_cvt_ts(parts[2])),
-                        mod_time=datetime.datetime.fromtimestamp(_cvt_ts(parts[3])),
-                        create_time=datetime.datetime.fromtimestamp(_cvt_ts(parts[4])),
-                        is_dir=int(parts[0][0] == 'd'))
+        # debug
+        try:
+            return FileMeta(path_id=0, file_name=parts[-1], file_size=int(parts[1]),
+                            access_time=datetime.datetime.fromtimestamp(_cvt_ts(parts[2])),
+                            mod_time=datetime.datetime.fromtimestamp(_cvt_ts(parts[3])),
+                            create_time=datetime.datetime.fromtimestamp(_cvt_ts(parts[4])),
+                            is_dir=int(parts[0][0] == 'd'))
+        except IndexError:
+            warn('Invalid scheme: "%s" for path "%s"' % (stdout, path))
+            raise
 
     def _pull_file(self, path: str, meta: FileMeta):
         local_path = os.path.join(self._path, 'tmp_adb_pull_file_%d' % threading.get_ident())
@@ -228,6 +247,7 @@ class BackupManager:
             return query_path.path_id
 
     def sync_remote(self, remote_path: str, db_path: str = '/'):
+        self._backup_db()
         remote_path = self._abs_path(remote_path)
         db_path = self._abs_path(db_path)
         st_remote = self._adb_stat(remote_path)
@@ -248,7 +268,11 @@ class BackupManager:
         try:
             while len(dirs) > 0:
                 cur_remote_path, cur_db_path = dirs.pop(0)
-                cur_db_path_id = self._sql_conn.select(DirectoryMeta, 1, path=cur_db_path).path_id
+                try:
+                    cur_db_path_id = self._sql_conn.select(DirectoryMeta, 1, path=cur_db_path).path_id
+                except AttributeError:
+                    warn('Failed to get database directory info: %s' % cur_db_path)
+                    continue
                 try:
                     remote_dirs, remote_files = self._adb_ls(cur_remote_path)
                 except Exception as ex:
@@ -281,7 +305,7 @@ class BackupManager:
                             path = cur_remote_path + '/' + name
                             with thread_lock:
                                 finished += 1
-                                print('[%d/%d] %s' % (finished, total, path))
+                                print('[%d/%d+%d] %s' % (finished, total, len(dirs), path))
                             try:
                                 meta = self._adb_stat(path)
                             except Exception as ex1:
@@ -336,6 +360,9 @@ class BackupManager:
                 # remote -> local (existed file)
                 def _pull_exist(path, meta):
                     db_meta = self._sql_conn.select(FileMeta, 1, path_id=cur_db_path_id, file_name=meta.file_name)
+                    if db_meta is None:
+                        warn('Failed to get database file meta: path_id: %d, file_name: %s' % cur_db_path_id, meta.file_name)
+                        return
                     if abs(get_datetime_timestamp(db_meta.mod_time) - get_datetime_timestamp(meta.mod_time)) > 1 or \
                             db_meta.file_size != meta.file_size:
                         try:
@@ -536,4 +563,15 @@ class BackupManager:
         cursor.execute("vacuum")
         cursor.close()
         self._sql_conn.commit()
-
+    
+    def restore_database(self):
+        if os.path.isfile(self._sql_file + '.bak'):
+            with open(self._sql_file + '.bak', 'rb') as f_in:
+                with open(self._sql_file, 'wb') as f_out:
+                    while True:
+                        buffer = f_in.read(4096)
+                        f_out.write(buffer)
+                        if len(buffer) == 0:
+                            break
+        else:
+            warn('Could not find backup database file, operation aborted')
