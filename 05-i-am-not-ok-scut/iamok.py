@@ -325,8 +325,7 @@ def req_main(username, password):
     lt_pattern = re.compile(r'<input.+name="lt"\s+value="([^"]+)"')
     match = re.search(lt_pattern, cas_login_page.text)
     if match is None:
-        print('Failed to find "lt" in login form')
-        exit(1)
+        raise RuntimeError('Failed to find "lt" in login form')
     lt = match.group(1)
     # login js code from https://sso.scut.edu.cn/cas/common/js/login2.js?v=2.0
     login_post_param = {
@@ -339,14 +338,14 @@ def req_main(username, password):
     }
     iamok = session.post('https://sso.scut.edu.cn/cas/login?service=https%3A%2F%2Fiamok.scut.edu.cn%2Fcas%2Flogin',
                          data=login_post_param)
-    assert iamok.ok
+    assert iamok.ok, 'HTTP Request failed with status code: %d' % iamok.status_code
     if not iamok.url.startswith('https://iamok.scut.edu.cn/'):
-        print('SSO Login failed, check username or password')
+        raise RuntimeError('SSO Login failed, check username or password')
     record = session.get('https://iamok.scut.edu.cn/mobile/recordPerDay/getRecordPerDay')
-    assert record.ok
+    assert record.ok, 'HTTP Request failed with status code: %d' % iamok.status_code
     record_json = record.json()
     result = session.post('https://iamok.scut.edu.cn/mobile/recordPerDay/submitRecordPerDay', json=record_json['data'])
-    assert result.ok
+    assert result.ok, 'HTTP Request failed with status code: %d' % iamok.status_code
 
 
 def main():

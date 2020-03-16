@@ -18,7 +18,11 @@ Linux系统可以添加到`crontab`实现每日自动打卡。
 ```bash
 crontab -e
 ```
-2. 加上该行：
+2. 加上该行（每日7点运行）：
 ```
-0 7 * * * python3.7 -u /home/pi/iamok.py --username xxx --password xxx >>/home/pi/iamok.log
+0 7 * * * /usr/local/bin/python3.7 -u /home/pi/iamok.py --username xxx --password xxx >>/home/pi/iamok.log 2>&1
+```
+3. 重启`cron`
+```bash
+sudo service cron restart
 ```
