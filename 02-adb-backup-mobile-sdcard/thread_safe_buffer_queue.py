@@ -1,6 +1,7 @@
-# Version 1.3
+# Version 1.4
 # CHANGELOG
-# Fixed some occasions that cause inappropriate QueueClosedException
+# 1.4: Changed default queue size to 0 (treated as infinite queue size)
+# 1.3: Fixed some occasions that cause inappropriate QueueClosedException
 import threading
 from typing import Any
 from time import time
@@ -28,7 +29,7 @@ class ThreadSafeBufferQueue:
     A helper class providing multi-threaded FIFO queue with specified size,
     enqueue or dequeue operation will be blocked if buffer is full or empty, respectively
     """
-    def __init__(self, queue_size: int = 4096):
+    def __init__(self, queue_size: int = 0):
         self._queue_size = queue_size
         self._mutex = threading.RLock()
         self._queue = []
@@ -53,7 +54,7 @@ class ThreadSafeBufferQueue:
             # infinite blocking code segment
             self._mutex.acquire()
             # after acquired the mutex lock, check the queue size
-            while len(self._queue) >= self._queue_size:
+            while len(self._queue) >= self._queue_size > 0:
                 # if the queue is currently full, release the mutex lock, wait consumer,
                 # and try to acquire the mutex lock again
                 self._mutex.release()
@@ -66,14 +67,14 @@ class ThreadSafeBufferQueue:
         else:
             # specified waiting time code segment, wrap all wait operations
             timeout = _wait(self._mutex.acquire, timeout)
-            while len(self._queue) >= self._queue_size:
+            while len(self._queue) >= self._queue_size > 0:
                 self._mutex.release()
                 timeout = _wait(self._queue_not_full_or_closed.wait, timeout)
                 if self._queue_closed.is_set():
                     raise QueueClosedException()
                 timeout = _wait(self._mutex.acquire, timeout)
         self._queue.append(obj)
-        if len(self._queue) >= self._queue_size:
+        if len(self._queue) >= self._queue_size > 0:
             self._queue_not_full.clear()
         self._queue_not_empty.set()
         self._mutex.release()
@@ -123,9 +124,8 @@ class ThreadSafeBufferQueue:
         return self._queue_size
 
     def set_queue_size(self, new_size: int):
-        assert new_size > 0, 'new queue size should be a positive integer'
         with self._mutex:
-            if new_size > len(self._queue):
+            if new_size > len(self._queue) or new_size <= 0:
                 self._queue_not_full.set()
             self._queue_size = new_size
 

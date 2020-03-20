@@ -7,7 +7,7 @@ import re
 import datetime
 import shutil
 import hashlib
-from time import time
+# from time import time
 import threading
 from thread_safe_buffer_queue import ThreadSafeBufferQueue, QueueClosedException
 import traceback
@@ -23,6 +23,17 @@ ls_al_pattern = re.compile(r'^(?P<permission>[dcbl-]([r-][w-][x-]){3}\+?)\s+'
                            r'((?P<file_size>\d+)\s+)?'
                            r'(?P<last_modification>\d+-\d+-\d+\s\d+:\d+)\s'
                            r'(?P<name>.+?)\s*$')
+
+
+class _StatusStatistics:
+    def __init__(self, thread_count: int):
+        self.total_files = 1
+        self.current_files = 0
+        self.total_dirs = 1
+        self.current_dirs = 0
+        self.adb_sem = threading.Semaphore(thread_count)
+        self.lock = threading.RLock()
+    __slots__ = ['total_files', 'current_files', 'total_dirs', 'current_dirs', 'lock', 'adb_sem']
 
 
 # noinspection PyUnresolvedReferences
@@ -108,7 +119,9 @@ class BackupManager:
         return '.'.join(part[:-1]), part[-1]
 
     @staticmethod
-    def _adb_ls(path: str) -> Tuple[List[str], List[str]]:
+    def _adb_ls(path: str, retry_count: int = 5) -> Tuple[List[str], List[str]]:
+        if retry_count == 0:
+            raise RuntimeError('Adb repeatedly returned empty ls result for path %s' % path)
         if not path.endswith('/'):
             path = path + '/'
         # escape char (') in linux shell
@@ -116,6 +129,8 @@ class BackupManager:
         stdout, stderr = spawn_process(['adb', 'shell', 'ls', '-al', "'%s'" % path], 'utf8')
         if len(stderr) > 0:
             raise RuntimeError(stderr)
+        if len(stdout) == 0:
+            return BackupManager._adb_ls(path, retry_count - 1)
         dirs = []
         files = []
         for line in stdout.split('\n'):
@@ -139,7 +154,7 @@ class BackupManager:
 
     def _adb_stat(self, path: str, retry_count: int = 5) -> FileMeta:
         if retry_count == 0:
-            raise RuntimeError('Adb repeatly returned empty stat result for path %s' % path)
+            raise RuntimeError('Adb repeatedly returned empty stat result for path %s' % path)
         # escape char (') in linux shell
         path_escaped = path.replace("'", "'\"'\"'")
         stdout, stderr = spawn_process(['adb', 'shell', 'stat', '-L', '-c', "'%A/%s/%X/%Y/%W/%n'",
@@ -188,9 +203,10 @@ class BackupManager:
                 shutil.move(local_path, dest_path)
             else:
                 os.remove(local_path)
-            if self._sql_conn.select(FileMeta, 1, path_id=meta.path_id, file_name=meta.file_name) is None:
+            db_meta = self._sql_conn.select(FileMeta, 1, path_id=meta.path_id, file_name=meta.file_name)
+            if db_meta is None:
                 self._sql_conn.insert(meta)
-            else:
+            elif meta != db_meta:
                 self._sql_conn.update(meta)
         except FileNotFoundError:
             warn('Could not pull file: %s' % path)
@@ -246,6 +262,126 @@ class BackupManager:
         else:
             return query_path.path_id
 
+    def _sync_remote_parallel_file_callback(self, file_queue: ThreadSafeBufferQueue, stat: _StatusStatistics):
+        while True:
+            try:
+                path_id, remote_path, db_path, call_fn = file_queue.dequeue()
+                try:
+                    with stat.adb_sem:
+                        meta = self._adb_stat(remote_path)
+                    meta.path_id = path_id
+                    call_fn(remote_path, db_path, meta)
+                except Exception as ex1:
+                    warn('exception while syncing remote dir metadata: %s' % ex1)
+                    traceback.print_exc()
+                    continue
+            except QueueClosedException:
+                return
+            except Exception as ex:
+                warn('Unexpected exception in slave thread: %s' % str(ex))
+
+    def _sync_remote_parallel_dir_callback(self, dir_queue: ThreadSafeBufferQueue, file_queue: ThreadSafeBufferQueue,
+                                           stat: _StatusStatistics):
+        while True:
+            try:
+                cur_remote_path, cur_db_path = dir_queue.dequeue()
+                try:
+                    cur_db_path_id = self._sql_conn.select(DirectoryMeta, 1, path=cur_db_path).path_id
+                except AttributeError:
+                    warn('Failed to get database directory info: %s' % cur_db_path)
+                    continue
+                try:
+                    with stat.adb_sem:
+                        remote_dirs, remote_files = self._adb_ls(cur_remote_path)
+                except Exception as ex:
+                    print('exception:', ex)
+                    traceback.print_exc()
+                    continue
+                with stat.lock:
+                    stat.total_dirs += len(remote_dirs)
+                    stat.total_files += len(remote_files)
+                db_metas = self.list_database(cur_db_path)
+                local_dirs = set([x.file_name for x in db_metas if x.is_dir != 0])
+                local_files = set([x.file_name for x in db_metas if x.is_dir == 0])
+                if cur_db_path == '/':
+                    cur_db_path = ''
+                if cur_remote_path == '/':
+                    cur_remote_path = ''
+                with stat.lock:
+                    stat.current_dirs += 1
+                    print('[%d/%d] %s' % (stat.current_files + stat.current_dirs,
+                                          stat.total_dirs + stat.total_files, cur_remote_path))
+                # remote -> local (new directory)
+                new_db_dirs = set(remote_dirs).difference(local_dirs)
+                for dir_name in new_db_dirs:
+                    self._create_db_path(cur_db_path + '/' + dir_name)
+
+                # remote -> local (deleted directory)
+                deleted_db_dirs = set(local_dirs).difference(remote_dirs)
+                for dir_name in deleted_db_dirs:
+                    self._remove_db(cur_db_path + '/' + dir_name)
+
+                # remote -> local (directory, sync meta)
+                def _sync_dir_meta(remote_path, db_path, meta):
+                    db_meta = self._sql_conn.select(FileMeta, 1, path_id=meta.path_id, file_name=meta.file_name)
+                    if db_meta is None or meta != db_meta:
+                        # changed: not updating db if nothing changed
+                        self._sql_conn.update(meta)
+                    dir_queue.enqueue((remote_path, db_path))
+                for dirs in remote_dirs:
+                    file_queue.enqueue((cur_db_path_id, cur_remote_path + '/' + dirs, cur_db_path + '/' + dirs,
+                                        _sync_dir_meta))
+
+                # remote -> local (new file)
+                def _fetch_new_file(path, _, meta):
+                    with stat.lock:
+                        stat.current_files += 1
+                        print('[%d/%d] %s' % (stat.current_files + stat.current_dirs,
+                                              stat.total_dirs + stat.total_files, path))
+                    with stat.adb_sem:
+                        self._pull_file(path, meta)
+                new_db_files = set(remote_files).difference(local_files)
+                for file in new_db_files:
+                    file_queue.enqueue((cur_db_path_id, cur_remote_path + '/' + file, cur_db_path + '/' + file,
+                                        _fetch_new_file))
+
+                # remote -> local (delete file)
+                deleted_db_files = set(local_files).difference(remote_files)
+                for file_name in deleted_db_files:
+                    self._sql_conn.delete(FileMeta, path_id=cur_db_path_id, file_name=file_name)
+
+                # remote -> local (existed file)
+                def _fetch_exist_file(path, _, meta):
+                    with stat.lock:
+                        stat.current_files += 1
+                        print('[%d/%d] %s' % (stat.current_files + stat.current_dirs,
+                                              stat.total_dirs + stat.total_files, path))
+                    db_meta = self._sql_conn.select(FileMeta, 1, path_id=meta.path_id, file_name=meta.file_name)
+                    if db_meta is None:
+                        warn('Failed to get database file meta: path_id: %d, file_name: %s'
+                             % (cur_db_path_id, meta.file_name))
+                        return
+                    if abs(get_datetime_timestamp(db_meta.mod_time) - get_datetime_timestamp(meta.mod_time)) > 1 \
+                            or db_meta.file_size != meta.file_size:
+                        with stat.adb_sem:
+                            self._pull_file(path, meta)
+
+                existed_files = set(local_files).intersection(remote_files)
+                for file in existed_files:
+                    file_queue.enqueue((cur_db_path_id, cur_remote_path + '/' + file, cur_db_path + '/' + file,
+                                        _fetch_exist_file))
+            except QueueClosedException:
+                with stat.lock:
+                    stat.current_dirs -= 1
+                return
+            except Exception as ex:
+                warn('Unexpected exception in slave thread: %s' % str(ex))
+            finally:
+                with stat.lock:
+                    if not dir_queue.is_closed and stat.current_dirs == stat.total_dirs:
+                        dir_queue.close()
+                        file_queue.close()
+
     def sync_remote(self, remote_path: str, db_path: str = '/'):
         self._backup_db()
         remote_path = self._abs_path(remote_path)
@@ -260,118 +396,26 @@ class BackupManager:
             self._pull_file(remote_path, st_remote)
             return
         self._create_db_path(db_path, exist_ok=True)
-        dirs = [(remote_path, db_path)]
-        total = 0
-        finished = 0
-        last_commit_ts = time()
-        thread_lock = threading.RLock()
+        dir_queue = ThreadSafeBufferQueue()
+        dir_queue.enqueue((remote_path, db_path))
+        file_queue = ThreadSafeBufferQueue(16384)
+        stat = _StatusStatistics(self._thread_count)
         try:
-            while len(dirs) > 0:
-                cur_remote_path, cur_db_path = dirs.pop(0)
-                try:
-                    cur_db_path_id = self._sql_conn.select(DirectoryMeta, 1, path=cur_db_path).path_id
-                except AttributeError:
-                    warn('Failed to get database directory info: %s' % cur_db_path)
-                    continue
-                try:
-                    remote_dirs, remote_files = self._adb_ls(cur_remote_path)
-                except Exception as ex:
-                    print('exception:', ex)
-                    traceback.print_exc()
-                    continue
-                total += len(remote_dirs) + len(remote_files)
-                db_metas = self.list_database(cur_db_path)
-                local_dirs = set([x.file_name for x in db_metas if x.is_dir != 0])
-                local_files = set([x.file_name for x in db_metas if x.is_dir == 0])
-                if cur_db_path == '/':
-                    cur_db_path = ''
-                # remote -> local (new directory)
-                new_db_dirs = set(remote_dirs).difference(local_dirs)
-                for dir_name in new_db_dirs:
-                    self._create_db_path(cur_db_path + '/' + dir_name)
-                # remote -> local (delete directory)
-                deleted_db_dirs = set(local_dirs).difference(remote_dirs)
-                for dir_name in deleted_db_dirs:
-                    self._remove_db(cur_db_path + '/' + dir_name)
-
-                def _worker_callback(queue, exit_event):
-                    nonlocal finished, last_commit_ts
-                    try:
-                        while True:
-                            try:
-                                name, callback = queue.dequeue()
-                            except QueueClosedException:
-                                return
-                            path = cur_remote_path + '/' + name
-                            with thread_lock:
-                                finished += 1
-                                print('[%d/%d+%d] %s' % (finished, total, len(dirs), path))
-                            try:
-                                meta = self._adb_stat(path)
-                            except Exception as ex1:
-                                print('exception:', ex1)
-                                traceback.print_exc()
-                                continue
-                            meta.path_id = cur_db_path_id
-                            callback(path, meta)
-                            with thread_lock:
-                                if time() - last_commit_ts > 300:
-                                    self._sql_conn.commit()
-                                    last_commit_ts = time()
-                    finally:
-                        exit_event.set()
-
-                def _parfor(it, callback):
-                    queue = ThreadSafeBufferQueue()
-                    events = []
-                    # noinspection PyTypeChecker
-                    for _ in range(min(self._thread_count, len(it))):
-                        e = threading.Event()
-                        t = threading.Thread(target=_worker_callback, args=(queue, e))
-                        t.start()
-                        events.append(e)
-                    for obj in it:
-                        queue.enqueue((obj, callback))
-                    queue.close()
-                    for e in events:
-                        e.wait()
-
-                # remote -> local (directory, sync meta)
-                def _create_dir(path, meta):
-                    self._sql_conn.update(meta)
-                    dirs.append((path, cur_db_path + '/' + meta.file_name))
-                _parfor(remote_dirs, _create_dir)
-
-                # remote -> local (new file)
-                def _pull_new(path, meta):
-                    try:
-                        self._pull_file(path, meta)
-                    except Exception as ex1:
-                        print('exception:', ex1)
-                        traceback.print_exc()
-                new_db_files = set(remote_files).difference(local_files)
-                _parfor(new_db_files, _pull_new)
-
-                # remote -> local (delete file)
-                deleted_db_files = set(local_files).difference(remote_files)
-                for file_name in deleted_db_files:
-                    self._sql_conn.delete(FileMeta, path_id=cur_db_path_id, file_name=file_name)
-
-                # remote -> local (existed file)
-                def _pull_exist(path, meta):
-                    db_meta = self._sql_conn.select(FileMeta, 1, path_id=cur_db_path_id, file_name=meta.file_name)
-                    if db_meta is None:
-                        warn('Failed to get database file meta: path_id: %d, file_name: %s' % cur_db_path_id, meta.file_name)
-                        return
-                    if abs(get_datetime_timestamp(db_meta.mod_time) - get_datetime_timestamp(meta.mod_time)) > 1 or \
-                            db_meta.file_size != meta.file_size:
-                        try:
-                            self._pull_file(path, meta)
-                        except Exception as ex1:
-                            print('exception:', ex1)
-                            traceback.print_exc()
-                existed_files = set(local_files).intersection(remote_files)
-                _parfor(existed_files, _pull_exist)
+            thds = []
+            for _ in range(self._thread_count):
+                thd = threading.Thread(target=self._sync_remote_parallel_dir_callback,
+                                       args=(dir_queue, file_queue, stat), daemon=True)
+                thds.append(thd)
+                thd.start()
+                thd = threading.Thread(target=self._sync_remote_parallel_file_callback,
+                                       args=(file_queue, stat), daemon=True)
+                thds.append(thd)
+                thd.start()
+            for thd in thds:
+                while thd.is_alive():
+                    thd.join(300)
+                    print('Auto committing database.')
+                    self._sql_conn.commit()
             self._validate_objects()
         finally:
             self._sql_conn.commit()
@@ -398,8 +442,6 @@ class BackupManager:
             stdout, stderr = spawn_process(args, 'utf8')
             if len(stderr) > 0:
                 raise RuntimeError(stderr)
-        else:
-            raise RuntimeError(stderr)
 
     @staticmethod
     def _remove_remote(path: str):
@@ -446,7 +488,7 @@ class BackupManager:
             for name in new_dirs:
                 self._create_remote_dir(cur_remote_path + '/' + name)
             # local -> remote (delete directory)
-            deleted_dirs = set(remote_dirs).difference(new_dirs)
+            deleted_dirs = set(remote_dirs).difference(db_dirs)
             for name in deleted_dirs:
                 self._remove_remote(cur_remote_path + '/' + name)
             # local -> remote (new files)
@@ -528,6 +570,7 @@ class BackupManager:
 
     def _extract_object(self, meta: FileMeta, dst: str):
         src = os.path.join(self._path, 'objects', '%02x' % meta.sha256[0], meta.sha256.hex())
+        print('Extracting %s' % dst)
         shutil.copy(src, dst)
         os.utime(dst, (int(get_datetime_timestamp(meta.access_time)), int(get_datetime_timestamp(meta.mod_time))))
 
@@ -538,10 +581,18 @@ class BackupManager:
             db_path = ''
         files = self._sql_conn.select(FileMeta, 0, path_id=path_id)
         for file in files:
+            fs_file_name = self._escape_windows_file_name(file.file_name)
             if file.is_dir:
-                self._map_dir(db_path + '/' + file.file_name, os.path.join(fs_path, file.file_name))
+                self._map_dir(db_path + '/' + file.file_name, os.path.join(fs_path, fs_file_name))
             else:
-                self._extract_object(file, os.path.join(fs_path, file.file_name))
+                self._extract_object(file, os.path.join(fs_path, fs_file_name))
+
+    @staticmethod
+    def _escape_windows_file_name(s: str):
+        s = s.rstrip('.')
+        for ch in r'?<>|\/:*"':
+            s = s.replace(ch, '_')
+        return s
 
     def map_database_to_fs(self, db_path: str, fs_path: str):
         db_path = self._abs_path(db_path)
@@ -550,7 +601,7 @@ class BackupManager:
             file_name = self._file_name(db_path)
             if os.path.isdir(fs_path):
                 # if fs path is a directory, create a new file to directory
-                fs_path = os.path.join(fs_path, file_name)
+                fs_path = os.path.join(fs_path, self._escape_windows_file_name(file_name))
             meta = self._sql_conn.select(FileMeta, 1, path_id=path_id, file_name=file_name)
             self._extract_object(meta, fs_path)
         elif path_type == self._ST_DIR:
