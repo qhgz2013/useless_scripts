@@ -1,5 +1,5 @@
 import os
-from sqlite_accessor import SqliteAccessor
+from sql_accessor import SqliteAccessor
 from entity import *
 from exceptions import *
 from util import spawn_process, get_datetime_timestamp
