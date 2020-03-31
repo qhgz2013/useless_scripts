@@ -342,10 +342,10 @@ def req_main(username, password):
     if not iamok.url.startswith('https://iamok.scut.edu.cn/'):
         raise RuntimeError('SSO Login failed, check username or password')
     record = session.get('https://iamok.scut.edu.cn/mobile/recordPerDay/getRecordPerDay')
-    assert record.ok, 'HTTP Request failed with status code: %d' % iamok.status_code
+    assert record.ok, 'HTTP Request failed with status code: %d' % record.status_code
     record_json = record.json()
     result = session.post('https://iamok.scut.edu.cn/mobile/recordPerDay/submitRecordPerDay', json=record_json['data'])
-    assert result.ok, 'HTTP Request failed with status code: %d' % iamok.status_code
+    assert result.ok, 'HTTP Request failed with status code: %d' % result.status_code
 
 
 def main():

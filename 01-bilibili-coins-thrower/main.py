@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 import requests
+from bvlib import bv_to_av
 
 oauth_filename = 'oauth.json'
 cache_coin_av_list = 'cache_voted_aid.json'
@@ -36,7 +37,8 @@ def main():
                                                headers={'Referer': 'https://www.bilibili.com'
                                                                    '/account/history'}).text[4:-1])
         for video in history_json['data']:
-            aid = video['aid']
+            bvid = video['bvid']
+            aid = video.get('aid', bv_to_av(bvid))
             copyright = video['copyright']
             headers = {'Referer': f'https://www.bilibili.com/video/av{aid}'}
             if aid not in cache_list:
@@ -68,6 +70,8 @@ def main():
                         json.dump(list(cache_list), f)
                     return
         if len(history_json['data']) == 0:
+            with open(cache_coin_av_list, 'w') as f:
+                json.dump(list(cache_list), f)
             return
         page += 1
 

@@ -1,5 +1,6 @@
-# Version 1.2
+# Version 1.3
 # CHANGELOG
+# Ver 1.3 Added insert_or_update() method, introduced entity field cache to improve speed
 # Ver 1.2 Added mysql support
 # Ver 1.1 Bug fixed and type hint changed for abstract sql statement generator
 import orm_utils
@@ -31,6 +32,17 @@ class AbstractSqlStatementGenerator:
     def update(entity: orm_utils.Entity, cursor: Any):
         raise NotImplementedError()
 
+    # basic idea of insert/update policy
+    @classmethod
+    def insert_or_update(cls, entity: orm_utils.Entity, cursor: Any):
+        primary_key_field_names = getattr(entity, '_member_inject_field_primary')
+        primary_keys = dict([(x, getattr(entity, x)) for x in primary_key_field_names])
+        db_entity = cls.select(type(entity), cursor, 1, **primary_keys)
+        if db_entity is None:
+            cls.insert(entity, cursor)
+        elif db_entity != entity:
+            cls.update(entity, cursor)
+
     @staticmethod
     def select(entity: Type[orm_utils.Entity], cursor: Any, fetch_count: int = 1, **keys: Any):
         raise NotImplementedError()
@@ -48,8 +60,7 @@ class AbstractSqlStatementGenerator:
 
 def _validate_select_query_fields(entity: Type[orm_utils.Entity], args: Iterable[str]) -> Tuple[Set[str], Set[str]]:
     # returns the name of table fields of specified entity type, and unexpected fields passed to args
-    basic_fields = [x for x in entity.__FIELDS__ if type(x) == orm_utils.TableFieldDescriptor]
-    field_names = set([x.field_name for x in basic_fields])
+    field_names = getattr(entity, '_member_inject_field_name')
     unexpected_fields = set(args).difference(field_names)
     return field_names, unexpected_fields
 
@@ -75,20 +86,6 @@ def _fetch_result(entity: Type[orm_utils.Entity], field_names: Iterable[str], cu
             entity_obj_list.append(entity_obj)
         entity_obj = entity_obj_list
     return entity_obj
-
-
-def _extract_primary_fields(entity: Union[Type[orm_utils.Entity], orm_utils.Entity],
-                            field_descriptors: Iterable[Any]) -> Set[str]:
-    # extract the name of primary key fields
-    primary_key_field_names = set([x.field_name for x in field_descriptors if x.primary_key])
-    if len(primary_key_field_names) == 0:
-        primary_key_field = [x for x in entity.__FIELDS__ if type(x) == orm_utils.MultiPrimaryKeyOrderDescriptor]
-        if len(primary_key_field) > 0:
-            assert len(primary_key_field) == 1, 'Invalid primary key count, got %d' % len(primary_key_field)
-            primary_key_field_names.update(primary_key_field[0].primary_key_orders)
-    else:
-        assert len(primary_key_field_names) == 1, 'Invalid primary key count, got %d' % len(primary_key_field_names)
-    return primary_key_field_names
 
 
 class SqliteSqlStatementGenerator(AbstractSqlStatementGenerator, dialect='sqlite'):
@@ -131,13 +128,12 @@ class SqliteSqlStatementGenerator(AbstractSqlStatementGenerator, dialect='sqlite
 
     @staticmethod
     def insert(entity: orm_utils.Entity, cursor: Any):
-        basic_fields = [x for x in entity.__FIELDS__ if type(x) == orm_utils.TableFieldDescriptor]
-        field_names = [x.field_name for x in basic_fields]
+        field_names = getattr(entity, '_member_inject_field_name')
         sql = 'insert into %s(%s) values (%s)' % (entity.__TABLE_NAME__, ', '.join(field_names),
-                                                  ', '.join(['?'] * len(basic_fields)))
+                                                  ', '.join(['?'] * len(field_names)))
         args = [getattr(entity, x) for x in field_names]
         cursor.execute(sql, args)
-        auto_increment_fields = [x for x in basic_fields if x.auto_increment]
+        auto_increment_fields = [x for x in getattr(entity, '_member_inject_field_dict').values() if x.auto_increment]
         if len(auto_increment_fields) > 0:
             assert len(auto_increment_fields) == 1, 'More than 1 auto increment fields are unsupported'
             if getattr(entity, auto_increment_fields[0].field_name) is None:
@@ -148,9 +144,8 @@ class SqliteSqlStatementGenerator(AbstractSqlStatementGenerator, dialect='sqlite
 
     @staticmethod
     def update(entity: orm_utils.Entity, cursor: Any):
-        basic_fields = [x for x in entity.__FIELDS__ if type(x) == orm_utils.TableFieldDescriptor]
-        field_names = set([x.field_name for x in basic_fields])
-        primary_key_field_names = _extract_primary_fields(entity, basic_fields)
+        field_names = set(getattr(entity, '_member_inject_field_name'))
+        primary_key_field_names = getattr(entity, '_member_inject_field_primary')
         updated_fields = field_names.difference(primary_key_field_names)
         sql = "update %s set %s where %s" % (entity.__TABLE_NAME__, ', '.join([x + ' = ?' for x in updated_fields]),
                                              ' and '.join([x + ' = ?' for x in primary_key_field_names]))
@@ -223,13 +218,12 @@ class MysqlSqlStatementGenerator(AbstractSqlStatementGenerator, dialect='mysql')
 
     @staticmethod
     def insert(entity: orm_utils.Entity, cursor: Any):
-        basic_fields = [x for x in entity.__FIELDS__ if type(x) == orm_utils.TableFieldDescriptor]
-        field_names = [x.field_name for x in basic_fields]
+        field_names = getattr(entity, '_member_inject_field_name')
         sql = 'insert into `%s`(`%s`) values (%s)' % (entity.__TABLE_NAME__, '`, `'.join(field_names),
-                                                      ', '.join(['%s'] * len(basic_fields)))
+                                                      ', '.join(['%s'] * len(field_names)))
         args = [getattr(entity, x) for x in field_names]
         cursor.execute(sql, args)
-        auto_increment_fields = [x for x in basic_fields if x.auto_increment]
+        auto_increment_fields = [x for x in getattr(entity, '_member_inject_field_dict').values() if x.auto_increment]
         if len(auto_increment_fields) > 0:
             assert len(auto_increment_fields) == 1, 'More than 1 auto increment fields are unsupported'
             if getattr(entity, auto_increment_fields[0].field_name) is None:
@@ -239,9 +233,8 @@ class MysqlSqlStatementGenerator(AbstractSqlStatementGenerator, dialect='mysql')
 
     @staticmethod
     def update(entity: orm_utils.Entity, cursor: Any):
-        basic_fields = [x for x in entity.__FIELDS__ if type(x) == orm_utils.TableFieldDescriptor]
-        field_names = set([x.field_name for x in basic_fields])
-        primary_key_field_names = _extract_primary_fields(entity, basic_fields)
+        field_names = set(getattr(entity, '_member_inject_field_name'))
+        primary_key_field_names = getattr(entity, '_member_inject_field_primary')
         updated_fields = field_names.difference(primary_key_field_names)
         sql = "update `%s` set %s where %s" % (entity.__TABLE_NAME__,
                                                ', '.join(['`'+x+'` = %s' for x in updated_fields]),

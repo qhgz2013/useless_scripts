@@ -27,7 +27,7 @@ ls_al_pattern = re.compile(r'^(?P<permission>[dcbl-]([r-][w-][x-]){3}\+?)\s+'
 
 class _StatusStatistics:
     def __init__(self, thread_count: int):
-        self.total_files = 1
+        self.total_files = 0
         self.current_files = 0
         self.total_dirs = 1
         self.current_dirs = 0
@@ -42,10 +42,12 @@ class BackupManager:
     _ST_DIR = 0
     _ST_NOT_FOUND = -1
 
-    def __init__(self, path: str, thread_count: int = 4):
+    def __init__(self, path: str, thread_count: int = 4, max_history_backup: int = 30):
         if not os.path.exists(path):
             os.makedirs(path, exist_ok=True)
         assert os.path.isdir(path), 'path must be a directory'
+        assert thread_count > 0, 'thread_count must be positive'
+        assert max_history_backup > 0, 'max_history_backup must be positive'
         self._path = path
         self._sql_file = os.path.join(self._path, 'entries.db')
         if not os.path.isfile(self._sql_file):
@@ -56,16 +58,34 @@ class BackupManager:
             os.makedirs(os.path.join(self._path, 'objects', '%02x' % i), exist_ok=True)
         spawn_process('adb start-server', 'utf8')
         self._thread_count = thread_count
+        self._max_history_backup = max_history_backup
+
+    def _list_backup_db_file(self):
+        candidate_db_files = []
+        pattern = re.compile(r'entries\.db\.(\d+)\.(\d+)\.(\d+)\.bak')
+        for file in os.listdir(self._path):
+            match = re.search(pattern, file)
+            if match is not None:
+                date = datetime.datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+                candidate_db_files.append((file, date))
+        candidate_db_files.sort(key=lambda x: x[1], reverse=True)
+        return [os.path.join(self._path, x[0]) for x in candidate_db_files]
     
     def _backup_db(self):
         print('Backing up database file.')
-        with open(self._sql_file + '.bak', 'wb') as f_out:
+        today = datetime.datetime.now()
+        today_backup_file_name = 'entries.db.%d.%d.%d.bak' % (today.year, today.month, today.day)
+        today_backup_file = os.path.join(self._path, today_backup_file_name)
+        with open(today_backup_file, 'wb') as f_out:
             with open(self._sql_file, 'rb') as f_in:
                 while True:
                     buffer = f_in.read(4096)
                     f_out.write(buffer)
                     if len(buffer) == 0:
                         break
+        candidate_db_files = self._list_backup_db_file()
+        for file in candidate_db_files[self._max_history_backup:]:
+            os.remove(os.path.join(self._path, file))
         print('Done.')
 
     def list_database(self, path: str) -> List[FileMeta]:
@@ -202,7 +222,12 @@ class BackupManager:
             if not os.path.exists(dest_path):
                 shutil.move(local_path, dest_path)
             else:
-                os.remove(local_path)
+                st_dest = os.stat(dest_path)
+                st_src = os.stat(local_path)
+                if st_dest.st_size == st_src.st_size:
+                    os.remove(local_path)
+                else:
+                    raise RuntimeError('Hash conflict for object %s (path: %s)' % (meta.sha256.hex(), path))
             db_meta = self._sql_conn.select(FileMeta, 1, path_id=meta.path_id, file_name=meta.file_name)
             if db_meta is None:
                 self._sql_conn.insert(meta)
@@ -272,9 +297,9 @@ class BackupManager:
                     meta.path_id = path_id
                     call_fn(remote_path, db_path, meta)
                 except Exception as ex1:
-                    warn('exception while syncing remote dir metadata: %s' % ex1)
-                    traceback.print_exc()
-                    continue
+                    warn('exception while syncing remote metadata: %s' % ex1)
+                    # traceback.print_exc()
+                    call_fn(remote_path, db_path, None)
             except QueueClosedException:
                 return
             except Exception as ex:
@@ -285,6 +310,10 @@ class BackupManager:
         while True:
             try:
                 cur_remote_path, cur_db_path = dir_queue.dequeue()
+                with stat.lock:
+                    stat.current_dirs += 1
+                    print('\r[%d/%d] %s' % (stat.current_files + stat.current_dirs,
+                                            stat.total_dirs + stat.total_files, cur_remote_path), end=' ', flush=True)
                 try:
                     cur_db_path_id = self._sql_conn.select(DirectoryMeta, 1, path=cur_db_path).path_id
                 except AttributeError:
@@ -294,7 +323,7 @@ class BackupManager:
                     with stat.adb_sem:
                         remote_dirs, remote_files = self._adb_ls(cur_remote_path)
                 except Exception as ex:
-                    print('exception:', ex)
+                    print('exception while listing path %s: %s' % (cur_remote_path, str(ex)))
                     traceback.print_exc()
                     continue
                 with stat.lock:
@@ -307,10 +336,6 @@ class BackupManager:
                     cur_db_path = ''
                 if cur_remote_path == '/':
                     cur_remote_path = ''
-                with stat.lock:
-                    stat.current_dirs += 1
-                    print('[%d/%d] %s' % (stat.current_files + stat.current_dirs,
-                                          stat.total_dirs + stat.total_files, cur_remote_path))
                 # remote -> local (new directory)
                 new_db_dirs = set(remote_dirs).difference(local_dirs)
                 for dir_name in new_db_dirs:
@@ -323,11 +348,20 @@ class BackupManager:
 
                 # remote -> local (directory, sync meta)
                 def _sync_dir_meta(remote_path, db_path, meta):
-                    db_meta = self._sql_conn.select(FileMeta, 1, path_id=meta.path_id, file_name=meta.file_name)
-                    if db_meta is None or meta != db_meta:
-                        # changed: not updating db if nothing changed
-                        self._sql_conn.update(meta)
-                    dir_queue.enqueue((remote_path, db_path))
+                    if meta is None:
+                        # failed to stat directory info, skipped
+                        with stat.lock:
+                            stat.current_dirs += 1
+                            print('\r[%d/%d] %s' % (stat.current_files + stat.current_dirs,
+                                                    stat.total_dirs + stat.total_files, cur_remote_path),
+                                  end=' ', flush=True)
+                        warn('Failed to fetch directory meta: %s, skipped' % remote_path, RuntimeWarning)
+                    else:
+                        db_meta = self._sql_conn.select(FileMeta, 1, path_id=meta.path_id, file_name=meta.file_name)
+                        if db_meta is None or meta != db_meta:
+                            # changed: not updating db if nothing changed
+                            self._sql_conn.update(meta)
+                        dir_queue.enqueue((remote_path, db_path))
                 for dirs in remote_dirs:
                     file_queue.enqueue((cur_db_path_id, cur_remote_path + '/' + dirs, cur_db_path + '/' + dirs,
                                         _sync_dir_meta))
@@ -336,10 +370,11 @@ class BackupManager:
                 def _fetch_new_file(path, _, meta):
                     with stat.lock:
                         stat.current_files += 1
-                        print('[%d/%d] %s' % (stat.current_files + stat.current_dirs,
-                                              stat.total_dirs + stat.total_files, path))
-                    with stat.adb_sem:
-                        self._pull_file(path, meta)
+                        print('\r[%d/%d] %s' % (stat.current_files + stat.current_dirs,
+                                                stat.total_dirs + stat.total_files, path), end=' ', flush=True)
+                    if meta is not None:
+                        with stat.adb_sem:
+                            self._pull_file(path, meta)
                 new_db_files = set(remote_files).difference(local_files)
                 for file in new_db_files:
                     file_queue.enqueue((cur_db_path_id, cur_remote_path + '/' + file, cur_db_path + '/' + file,
@@ -354,25 +389,24 @@ class BackupManager:
                 def _fetch_exist_file(path, _, meta):
                     with stat.lock:
                         stat.current_files += 1
-                        print('[%d/%d] %s' % (stat.current_files + stat.current_dirs,
-                                              stat.total_dirs + stat.total_files, path))
-                    db_meta = self._sql_conn.select(FileMeta, 1, path_id=meta.path_id, file_name=meta.file_name)
-                    if db_meta is None:
-                        warn('Failed to get database file meta: path_id: %d, file_name: %s'
-                             % (cur_db_path_id, meta.file_name))
-                        return
-                    if abs(get_datetime_timestamp(db_meta.mod_time) - get_datetime_timestamp(meta.mod_time)) > 1 \
-                            or db_meta.file_size != meta.file_size:
-                        with stat.adb_sem:
-                            self._pull_file(path, meta)
+                        print('\r[%d/%d] %s' % (stat.current_files + stat.current_dirs,
+                                                stat.total_dirs + stat.total_files, path), end=' ', flush=True)
+                    if meta is not None:
+                        db_meta = self._sql_conn.select(FileMeta, 1, path_id=meta.path_id, file_name=meta.file_name)
+                        if db_meta is None:
+                            warn('Failed to get database file meta: path_id: %d, file_name: %s'
+                                 % (cur_db_path_id, meta.file_name))
+                            return
+                        if abs(get_datetime_timestamp(db_meta.mod_time) - get_datetime_timestamp(meta.mod_time)) > 1 \
+                                or db_meta.file_size != meta.file_size:
+                            with stat.adb_sem:
+                                self._pull_file(path, meta)
 
                 existed_files = set(local_files).intersection(remote_files)
                 for file in existed_files:
                     file_queue.enqueue((cur_db_path_id, cur_remote_path + '/' + file, cur_db_path + '/' + file,
                                         _fetch_exist_file))
             except QueueClosedException:
-                with stat.lock:
-                    stat.current_dirs -= 1
                 return
             except Exception as ex:
                 warn('Unexpected exception in slave thread: %s' % str(ex))
@@ -417,6 +451,10 @@ class BackupManager:
                     print('Auto committing database.')
                     self._sql_conn.commit()
             self._validate_objects()
+            # debug
+            with stat.lock:
+                print('Directories: %d/%d' % (stat.current_dirs, stat.total_dirs))
+                print('Files: %d/%d' % (stat.current_files, stat.total_files))
         finally:
             self._sql_conn.commit()
 
@@ -517,29 +555,44 @@ class BackupManager:
             for name in db_dirs:
                 dirs.append((cur_remote_path + '/' + name, cur_db_path + '/' + name))
 
-    def _validate_objects(self):
-        print('Validating objects')
+    def _validate_objects(self, remove_unused: bool = False):
+        print('Checking database objects.')
+        backup_db_files = self._list_backup_db_file()
+        print('[1/%d] %s' % (len(backup_db_files) + 1, self._sql_file))
         cursor = self._sql_conn.cursor()
         cursor.execute("select sha256 from file_meta where is_dir == 0")
         db_sha256 = set([x[0] for x in cursor.fetchall()])
+        cursor.close()
+        for i, db_file in enumerate(backup_db_files):
+            print('[%d/%d] %s' % (i + 2, len(backup_db_files) + 1, db_file))
+            conn = SqliteAccessor(db_file)
+            cursor = conn.cursor()
+            cursor.execute("select sha256 from file_meta where is_dir == 0")
+            db_sha256.update([x[0] for x in cursor.fetchall()])
+            cursor.close()
+            conn.close()
         if None in db_sha256:
             warn('Detected missing sha256 hash in database, re-run sync to solve this problem')
             db_sha256.remove(None)
-        cursor.close()
+        print('Checking file system objects.')
         fs_sha256 = set()
         for _, _, files in os.walk(os.path.join(self._path, 'objects')):
             for file in files:
                 fs_sha256.add(bytes.fromhex(file))
+        print('Done.')
         missing_sha256 = db_sha256.difference(fs_sha256)
         non_reference_sha256 = fs_sha256.difference(db_sha256)
         if len(missing_sha256) > 0:
             warn("Detected missing %d objects from file system, re-run sync to solve this problem" %
                  len(missing_sha256))
-        for sha256 in non_reference_sha256:
-            path = os.path.join(self._path, 'objects', '%02x' % sha256[0], sha256.hex())
-            os.remove(path)
         if len(non_reference_sha256) > 0:
-            print('Removed %d unused objects' % len(non_reference_sha256))
+            if remove_unused:
+                for sha256 in non_reference_sha256:
+                    path = os.path.join(self._path, 'objects', '%02x' % sha256[0], sha256.hex())
+                    os.remove(path)
+                print('Removed %d unused objects' % len(non_reference_sha256))
+            else:
+                print('Detected %d objects are unreferenced' % len(non_reference_sha256))
 
     def _remove_db(self, db_path: str):
         db_path = self._abs_path(db_path)
@@ -615,14 +668,17 @@ class BackupManager:
         cursor.close()
         self._sql_conn.commit()
     
-    def restore_database(self):
-        if os.path.isfile(self._sql_file + '.bak'):
-            with open(self._sql_file + '.bak', 'rb') as f_in:
-                with open(self._sql_file, 'wb') as f_out:
-                    while True:
-                        buffer = f_in.read(4096)
-                        f_out.write(buffer)
-                        if len(buffer) == 0:
-                            break
-        else:
-            warn('Could not find backup database file, operation aborted')
+    # def restore_database(self):
+    #     if os.path.isfile(self._sql_file + '.bak'):
+    #         with open(self._sql_file + '.bak', 'rb') as f_in:
+    #             with open(self._sql_file, 'wb') as f_out:
+    #                 while True:
+    #                     buffer = f_in.read(4096)
+    #                     f_out.write(buffer)
+    #                     if len(buffer) == 0:
+    #                         break
+    #     else:
+    #         warn('Could not find backup database file, operation aborted')
+
+    def cleanup_objects(self):
+        self._validate_objects(remove_unused=True)

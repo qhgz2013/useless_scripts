@@ -1,6 +1,6 @@
-# Version 1.4
+# Version 1.4.2
 # CHANGELOG
-# ver 1.4: added mysql support
+# ver 1.4: added mysql support, close() and insert_or_update() method
 # ver 1.3: added future support for generic sql accessor class
 # ver 1.2: providing global lock for multi-threaded access
 # ver 1.1: enabled strict foreign key, create table sequence order is controlled by foreign key constraints now
@@ -74,6 +74,13 @@ class GenericSqlAccessor:
             self._generator.update(entity, cursor)
             cursor.close()
 
+    def insert_or_update(self, entity: orm_utils.Entity):
+        with self._global_lock:
+            cursor = self._connection.cursor()
+            self._create_table_dependency_order(cursor, type(entity))
+            self._generator.insert_or_update(entity, cursor)
+            cursor.close()
+
     def select(self, entity: Type[orm_utils.Entity], fetch_count: int, **keys):
         with self._global_lock:
             cursor = self._connection.cursor()
@@ -92,6 +99,10 @@ class GenericSqlAccessor:
     def commit(self):
         with self._global_lock:
             self._connection.commit()
+
+    def close(self):
+        with self._global_lock:
+            self._connection.close()
 
     def cursor(self):
         return self._connection.cursor()
