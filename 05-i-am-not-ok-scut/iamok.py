@@ -1,8 +1,14 @@
 import argparse
 import requests
 import re
+# added mail support
+from email.mime.text import MIMEText
+import smtplib
+import traceback
+import datetime
 
 
+# noinspection DuplicatedCode
 def str_enc(data, first_key, second_key, third_key):
     # function strEnc from https://sso.scut.edu.cn/cas/common/js/des.js
     leng = len(data)
@@ -47,10 +53,9 @@ def str_enc(data, first_key, second_key, third_key):
         else:
             iterator = int(leng / 4)
             remainder = leng % 4
-            i = 0
             enc_data = ''
             for i in range(iterator):
-                temp_data = data[i*4:i*4+4]
+                temp_data = data[i * 4:i * 4 + 4]
                 temp_byte = str_to_bt(temp_data)
                 enc_byte = None
                 if first_key is not None and first_key != "" and second_key is not None and second_key != "" and \
@@ -77,7 +82,7 @@ def str_enc(data, first_key, second_key, third_key):
                     enc_byte = temp_bt
                 enc_data += bt64_to_hex(enc_byte)
             if remainder > 0:
-                remainder_data = data[iterator*4:leng]
+                remainder_data = data[iterator * 4:leng]
                 temp_byte = str_to_bt(remainder_data)
                 enc_byte = None
                 if first_key is not None and first_key != "" and second_key is not None and second_key != "" and \
@@ -113,9 +118,9 @@ def get_key_bytes(key):
     key_bytes = []
     i = 0
     for i in range(iterator):
-        key_bytes.append(str_to_bt(key[i*4:i*4+4]))
+        key_bytes.append(str_to_bt(key[i * 4:i * 4 + 4]))
     if remainder > 0:
-        key_bytes.append(str_to_bt(key[i*4:leng]))
+        key_bytes.append(str_to_bt(key[i * 4:leng]))
     return key_bytes
 
 
@@ -127,7 +132,7 @@ def enc(data_byte, key_byte):
     temp_left = [0] * 32
     for k in range(32):
         ip_left[k] = ip_byte[k]
-        ip_right[k] = ip_byte[32+k]
+        ip_right[k] = ip_byte[32 + k]
     for i in range(16):
         for j in range(32):
             temp_left[j] = ip_left[j]
@@ -139,24 +144,24 @@ def enc(data_byte, key_byte):
     final_data = [0] * 64
     for i in range(32):
         final_data[i] = ip_right[i]
-        final_data[32+i] = ip_left[i]
+        final_data[32 + i] = ip_left[i]
     return finally_permute(final_data)
 
 
 def generate_keys(key_byte):
-    loop = [1,1,2,2,2,2,2,2,1,2,2,2,2,2,2,1]
+    loop = [1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1]
     key = [0] * 56
     keys = [list() for _ in range(16)]
     for i in range(7):
         for j, k in zip(range(8), range(7, -1, -1)):
-            key[i*8+j] = key_byte[8*k+i]
+            key[i * 8 + j] = key_byte[8 * k + i]
     for i in range(16):
         for j in range(loop[i]):
             temp_left = key[0]
             temp_right = key[28]
             for k in range(27):
-                key[k] = key[k+1]
-                key[28+k] = key[29+k]
+                key[k] = key[k + 1]
+                key[28 + k] = key[29 + k]
             key[27] = temp_left
             key[55] = temp_right
         access_ord = [13, 16, 10, 23, 0, 4, 2, 27, 14, 5, 20, 9, 22, 18, 11, 3, 25, 7, 15, 6, 26, 19, 12, 1, 40, 51, 30,
@@ -173,8 +178,8 @@ def init_permute(original_data):
     ip_byte = [0] * 64
     for i, m, n in zip(range(4), range(1, 9, 2), range(0, 8, 2)):
         for j, k in zip(range(7, -1, -1), range(8)):
-            ip_byte[i*8+k] = original_data[j*8+m]
-            ip_byte[i*8+k+32] = original_data[j*8+n]
+            ip_byte[i * 8 + k] = original_data[j * 8 + m]
+            ip_byte[i * 8 + k + 32] = original_data[j * 8 + n]
     return ip_byte
 
 
@@ -182,17 +187,17 @@ def expand_permute(right_data):
     ep_byte = [0] * 48
     for i in range(8):
         if i == 0:
-            ep_byte[i*6+0] = right_data[31]
+            ep_byte[i * 6 + 0] = right_data[31]
         else:
-            ep_byte[i*6+0] = right_data[i*4-1]
-        ep_byte[i*6+1] = right_data[i*4+0]
-        ep_byte[i*6+2] = right_data[i*4+1]
-        ep_byte[i*6+3] = right_data[i*4+2]
-        ep_byte[i*6+4] = right_data[i*4+3]
+            ep_byte[i * 6 + 0] = right_data[i * 4 - 1]
+        ep_byte[i * 6 + 1] = right_data[i * 4 + 0]
+        ep_byte[i * 6 + 2] = right_data[i * 4 + 1]
+        ep_byte[i * 6 + 3] = right_data[i * 4 + 2]
+        ep_byte[i * 6 + 4] = right_data[i * 4 + 3]
         if i == 7:
-            ep_byte[i*6+5] = right_data[0]
+            ep_byte[i * 6 + 5] = right_data[0]
         else:
-            ep_byte[i*6+5] = right_data[i*4+4]
+            ep_byte[i * 6 + 5] = right_data[i * 4 + 4]
     return ep_byte
 
 
@@ -246,13 +251,14 @@ def s_box_permute(expand_byte):
          [2, 1, 14, 7, 4, 10, 8, 13, 15, 12, 9, 0, 3, 5, 6, 11]]
     ]
     for m in range(8):
-        i = expand_byte[m*6+0]*2+expand_byte[m*6+5]
-        j = expand_byte[m*6+1]*8+expand_byte[m*6+2]*4+expand_byte[m*6+3]*2+expand_byte[m*6+4]
+        i = expand_byte[m * 6 + 0] * 2 + expand_byte[m * 6 + 5]
+        j = expand_byte[m * 6 + 1] * 8 + expand_byte[m * 6 + 2] * 4 + expand_byte[m * 6 + 3] * 2 + expand_byte[
+            m * 6 + 4]
         binary = get_box_binary(s[m][i][j])
-        s_box_byte[m*4+0] = int(binary[0])
-        s_box_byte[m*4+1] = int(binary[1])
-        s_box_byte[m*4+2] = int(binary[2])
-        s_box_byte[m*4+3] = int(binary[3])
+        s_box_byte[m * 4 + 0] = int(binary[0])
+        s_box_byte[m * 4 + 1] = int(binary[1])
+        s_box_byte[m * 4 + 2] = int(binary[2])
+        s_box_byte[m * 4 + 3] = int(binary[3])
     return s_box_byte
 
 
@@ -270,6 +276,7 @@ def p_permute(s_box_byte):
     return p_box_permute
 
 
+# noinspection DuplicatedCode,PyShadowingBuiltins
 def str_to_bt(s):
     leng = len(s)
     bt = [0] * 64
@@ -280,14 +287,14 @@ def str_to_bt(s):
                 pow = 1
                 for m in range(15, j, -1):
                     pow *= 2
-                bt[16*i+j] = int(k/pow) % 2
+                bt[16 * i + j] = int(k / pow) % 2
         for p in range(leng, 4):
             k = 0
             for q in range(16):
                 pow = 1
                 for m in range(15, q, -1):
                     pow *= 2
-                bt[16*p+q] = int(k/pow) % 2
+                bt[16 * p + q] = int(k / pow) % 2
     else:
         for i in range(4):
             k = ord(s[i])
@@ -295,7 +302,7 @@ def str_to_bt(s):
                 pow = 1
                 for m in range(15, j, -1):
                     pow *= 2
-                bt[16*i+j] = int(k/pow) % 2
+                bt[16 * i + j] = int(k / pow) % 2
     return bt
 
 
@@ -314,46 +321,74 @@ def bt64_to_hex(byte_data):
     for i in range(16):
         bt = ''
         for j in range(4):
-            bt += str(byte_data[i*4+j])
+            bt += str(byte_data[i * 4 + j])
         hex_ += '%X' % int(bt, 2)
     return hex_
 
 
-def req_main(username, password):
-    session = requests.session()
-    cas_login_page = session.get('https://iamok.scut.edu.cn/')
-    lt_pattern = re.compile(r'<input.+name="lt"\s+value="([^"]+)"')
-    match = re.search(lt_pattern, cas_login_page.text)
-    if match is None:
-        raise RuntimeError('Failed to find "lt" in login form')
-    lt = match.group(1)
-    # login js code from https://sso.scut.edu.cn/cas/common/js/login2.js?v=2.0
-    login_post_param = {
-        'ul': len(username),
-        'pl': len(password),
-        'lt': lt,
-        'rsa': str_enc(username + password + lt, '1', '2', '3'),
-        'execution': 'e1s1',
-        '_eventId': 'submit'
-    }
-    iamok = session.post('https://sso.scut.edu.cn/cas/login?service=https%3A%2F%2Fiamok.scut.edu.cn%2Fcas%2Flogin',
-                         data=login_post_param)
-    assert iamok.ok, 'HTTP Request failed with status code: %d' % iamok.status_code
-    if not iamok.url.startswith('https://iamok.scut.edu.cn/'):
-        raise RuntimeError('SSO Login failed, check username or password')
-    record = session.get('https://iamok.scut.edu.cn/mobile/recordPerDay/getRecordPerDay')
-    assert record.ok, 'HTTP Request failed with status code: %d' % record.status_code
-    record_json = record.json()
-    result = session.post('https://iamok.scut.edu.cn/mobile/recordPerDay/submitRecordPerDay', json=record_json['data'])
-    assert result.ok, 'HTTP Request failed with status code: %d' % result.status_code
+def req_main(username, password, smtp_server, smtp_port, smtp_passwd, email_from, email_to):
+    try:
+        session = requests.session()
+        cas_login_page = session.get('https://iamok.scut.edu.cn/')
+        lt_pattern = re.compile(r'<input.+name="lt"\s+value="([^"]+)"')
+        match = re.search(lt_pattern, cas_login_page.text)
+        if match is None:
+            raise RuntimeError('Failed to find "lt" in login form')
+        lt = match.group(1)
+        # login js code from https://sso.scut.edu.cn/cas/common/js/login2.js?v=2.0
+        login_post_param = {
+            'ul': len(username),
+            'pl': len(password),
+            'lt': lt,
+            'rsa': str_enc(username + password + lt, '1', '2', '3'),
+            'execution': 'e1s1',
+            '_eventId': 'submit'
+        }
+        iamok = session.post('https://sso.scut.edu.cn/cas/login?service=https%3A%2F%2Fiamok.scut.edu.cn%2Fcas%2Flogin',
+                             data=login_post_param)
+        assert iamok.ok, 'HTTP Request failed with status code: %d' % iamok.status_code
+        if not iamok.url.startswith('https://iamok.scut.edu.cn/'):
+            raise RuntimeError('SSO Login failed, check username or password')
+        record = session.get('https://iamok.scut.edu.cn/mobile/recordPerDay/getRecordPerDay')
+        assert record.ok, 'HTTP Request failed with status code: %d' % record.status_code
+        record_json = record.json()
+        result = session.post('https://iamok.scut.edu.cn/mobile/recordPerDay/submitRecordPerDay',
+                              json=record_json['data'])
+        assert result.ok, 'HTTP Request failed with status code: %d' % result.status_code
+        print('Script run normally.')
+    except Exception as ex:
+        traceback.print_exc()
+        if smtp_server is not None and smtp_port is not None and email_from is not None and email_to is not None and \
+                smtp_passwd is not None:
+            smtp_conn = smtplib.SMTP_SSL(smtp_server, smtp_port)
+            smtp_conn.login(email_from, smtp_passwd)
+            ex_type = type(ex)
+            ex_type_str = ex_type.__module__ + '.' + ex_type.__name__
+            content_fmt = 'I am ok script error report:\n\nTimestamp:\n%s\n\nException type:\n%s\n\n' \
+                          'Exception string:\n%s\n\nFull traceback stack:\n%s'
+            content = content_fmt % (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                     ex_type_str, str(ex), traceback.format_exc())
+            msg = MIMEText(content)
+            msg['Subject'] = 'I am ok script error'
+            msg['From'] = email_from
+            msg['To'] = email_to
+            smtp_conn.sendmail(email_from, email_to, msg.as_string())
+            smtp_conn.quit()
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--username', '-u', help='统一认证账号', type=str, required=True)
     parser.add_argument('--password', '-p', help='统一认证密码', type=str, required=True)
+    parser.add_argument('--smtp_server', help='SMTP服务器地址，用于签到失败时的通知', type=str)
+    parser.add_argument('--smtp_port', help='SMTP服务器端口，用于签到失败时的通知', type=int)
+    parser.add_argument('--smtp_password', help='SMTP服务器密码，用于签到失败时的通知', type=str)
+    parser.add_argument('--email_from', help='发信人邮箱地址，用于签到失败时的通知', type=str)
+    parser.add_argument('--email_to', help='收信人邮箱地址（若自己发给自己，则此处与发信人地址相同），用于签到失败时的通知',
+                        type=str)
     args = parser.parse_args()
-    req_main(username=args.username, password=args.password)
+    req_main(username=args.username, password=args.password, smtp_server=args.smtp_server, smtp_port=args.smtp_port,
+             smtp_passwd=args.smtp_password, email_from=args.email_from, email_to=args.email_to)
 
 
 if __name__ == '__main__':
