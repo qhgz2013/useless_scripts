@@ -329,7 +329,7 @@ def bt64_to_hex(byte_data):
 def req_main(username, password, smtp_server, smtp_port, smtp_passwd, email_from, email_to):
     try:
         session = requests.session()
-        cas_login_page = session.get('https://iamok.scut.edu.cn/')
+        cas_login_page = session.get('https://enroll.scut.edu.cn/door/index_h5.html')
         lt_pattern = re.compile(r'<input.+name="lt"\s+value="([^"]+)"')
         match = re.search(lt_pattern, cas_login_page.text)
         if match is None:
@@ -344,16 +344,16 @@ def req_main(username, password, smtp_server, smtp_port, smtp_passwd, email_from
             'execution': 'e1s1',
             '_eventId': 'submit'
         }
-        iamok = session.post('https://sso.scut.edu.cn/cas/login?service=https%3A%2F%2Fiamok.scut.edu.cn%2Fcas%2Flogin',
+        iamok = session.post('https://sso.scut.edu.cn/cas/login?service=https%3A%2F%2Fenroll.scut.edu.cn%2Fdoor%2Findex_h5.html',
                              data=login_post_param)
         assert iamok.ok, 'HTTP Request failed with status code: %d' % iamok.status_code
-        if not iamok.url.startswith('https://iamok.scut.edu.cn/'):
+        if not iamok.url.startswith('https://enroll.scut.edu.cn/door/index_h5.html'):
             raise RuntimeError('SSO Login failed, check username or password')
-        record = session.get('https://iamok.scut.edu.cn/mobile/recordPerDay/getRecordPerDay')
+        record = session.get('https://enroll.scut.edu.cn/door/health/h5/get')
         assert record.ok, 'HTTP Request failed with status code: %d' % record.status_code
         record_json = record.json()
-        result = session.post('https://iamok.scut.edu.cn/mobile/recordPerDay/submitRecordPerDay',
-                              json=record_json['data'])
+        result = session.post('https://enroll.scut.edu.cn/door/health/h5/oneKeyAdd', data=b'')
+        # Referer: https://enroll.scut.edu.cn/door/health/h5/health.html + Origin
         assert result.ok, 'HTTP Request failed with status code: %d' % result.status_code
         print('Script run normally.')
     except Exception as ex:
