@@ -352,7 +352,18 @@ def req_main(username, password, smtp_server, smtp_port, smtp_passwd, email_from
         record = session.get('https://enroll.scut.edu.cn/door/health/h5/get')
         assert record.ok, 'HTTP Request failed with status code: %d' % record.status_code
         record_json = record.json()
-        result = session.post('https://enroll.scut.edu.cn/door/health/h5/oneKeyAdd', data=b'')
+        expected_fields = ['sPersonName', 'sPersonCode', 'sPhone', 'sParentPhone', 'iIsGangAoTai', 'iIsOversea',
+                           'sHomeProvName', 'sHomeProvCode', 'sHomeCityName', 'sHomeCityCode', 'sHomeCountyName',
+                           'sHomeCountyCode', 'sHomeAddr', 'iSelfState', 'iFamilyState', 'sNowProvName', 'sNowProvCode',
+                           'sNowCityName', 'sNowCityCode', 'sNowCountyName', 'sNowCountyCode', 'sNowAddr',
+                           'iNowGoRisks', 'iRctRisks', 'iRctKey', 'iRctOut', 'iRctTouchKeyMan', 'iRctTouchBackMan',
+                           'iRctTouchDoubtMan', 'iVaccinState', 'iHealthCodeState', 'sVaccinFactoryName',
+                           'sVaccinFactoryCode', 'iVaccinType', 'dVaccin1Date', 'sDegreeCode', 'iSex', 'sCollegeName',
+                           'sCampusName', 'sDormBuild', 'sMajorName', 'sClassName', 'iInSchool', 'dVaccin2Date']
+        new_values = {k: record_json['data']['healthRptInfor'][k] for k in expected_fields}
+        new_values['dRptDate'] = datetime.datetime.now().strftime('%Y-%m-%d')
+        new_values['iRptState'] = 0
+        result = session.post('https://enroll.scut.edu.cn/door/health/h5/add', data=new_values)
         # Referer: https://enroll.scut.edu.cn/door/health/h5/health.html + Origin
         assert result.ok, 'HTTP Request failed with status code: %d' % result.status_code
         print('Script run normally.')
